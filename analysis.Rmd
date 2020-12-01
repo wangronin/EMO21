@@ -1,0 +1,378 @@
+---
+title: "EMO '21"
+author: Hao Wang, Tome Eftimov, and Carlos Herńandez
+output: html_notebook
+---
+
+```{r setup, echo = FALSE, warning = FALSE, cache = FALSE}
+library(ggplot2)
+library(magrittr)
+library(reshape2)
+library(data.table)
+library(latex2exp)
+library(MASS)
+library(viridis)
+library(xtable)
+
+# plot settings
+t <- theme_grey() +
+  theme(
+    text = element_text(size = 22),
+    legend.position = 'bottom',
+    legend.key.size = unit(2, "line"),
+    plot.title = element_text(size = 25, hjust = 0.5),
+    axis.title.x = element_text(vjust = -.7, size = 22),
+    axis.title.y = element_text(vjust = .7, size = 22),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 20),
+    axis.text.y = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 20),
+    strip.text.x = element_text(size = 30),
+    strip.text.y = element_text(size = 30)
+  )
+theme_set(t)
+```
+
+## Read and preprocess the data
+```{r}
+dt <- fread('indicators2.csv')
+dt <- dt[Indicator != 1
+         ][, Indicator := as.character(Indicator)
+           ][Indicator == '2', Indicator := 'DeltaP'
+             ][Indicator == '3', Indicator := 'HV']
+
+dt[, obj := factor(paste0(obj, 'D'), levels = paste0(unique(obj), 'D'))]
+dt[, Problem := factor(paste0('F', Problem), levels = paste0('F', unique(Problem)))]
+
+dt[, Algorithm := as.character(Algorithm)]
+dt[Algorithm == '1', Algorithm := 'NSGA-II']
+dt[Algorithm == '2', Algorithm := 'NSGA-III']
+dt[Algorithm == '3', Algorithm := 'MOEA/D']
+dt[Algorithm == '4', Algorithm := 'SPEA-SDE']
+```
+
+## Normalized the data
+```{r}
+.normalize <- function(x) {
+  .min <- min(x)
+  .max <- max(x)
+  delta <- .max - .min
+  if (delta > 0)
+    return((x - .min) / delta)
+  else
+    return(rep(1, length(x)))
+}
+  
+dt_plot <- dcast(dt, Algorithm + Problem + Exp + obj ~ Indicator, value.var = 'Value')
+dt_plot[, HV := .normalize(HV), by = .(Problem, obj)]
+dt_plot[, DeltaP := 1 - .normalize(DeltaP), by = .(Problem, obj)]
+
+dt <- melt(dt_plot, id.vars = c('Algorithm', 'Problem', 'Exp', 'obj'), 
+           variable.name = 'Indicator',
+           value.name = 'value')
+fwrite(dt, 'normalized.csv')
+```
+
+```{r}
+gg.hist <- function(dt_plot, dim, fid) {
+  dt_mean <- dt_plot[, mean(x), by = group]
+  ggplot(dt_plot, aes(x = x)) + 
+    geom_histogram(aes(y = ..density..), colour = 'black', fill = "white", binwidth = 0.02, size = 1.2) + 
+    geom_density(alpha = .2, fill = "#FF6666") + 
+    geom_vline(data = dt_mean, aes(xintercept = V1), size = 1.2, colour = 'blue', alpha = 0.8, linetype = 'dashed') + 
+    labs(x = 'LD', y = 'density/count') +
+    scale_x_continuous(breaks = seq(0, 1, by = 0.25)) +
+    facet_wrap(vars(group), ncol = 1, scales = "free_y") +
+    labs(title = paste0(dim, '-', fid))
+}
+```
+
+## Multivariate Epsilon test grouping
+```{r}
+data_dir <- './DSC-result'
+files <- list.files(path = data_dir, pattern = "^multivariate_sets")
+grouping.dt <- list()
+
+algorithm_map <- list(
+  `1` = 'NSGA-II',
+  `2` = 'NSGA-III',
+  `3` = 'MOEA/D',
+  `4` = 'SPEA-SDE'
+)
+
+i <- 1
+for (file_name in files) {
+  fid <- gsub('.*_(F\\d+)_.*', '\\1', file_name)
+  dim <- gsub('.*_(\\d+D).*', '\\1', file_name)
+  
+  con <- file(file.path(data_dir, file_name), 'r') 
+  data <- readLines(con) %>% unique
+  close(con)
+  
+  if (length(data) == 4) next
+  
+  groups <- c()
+  for (g in data) {
+    a <- strsplit(as.character(g), ' ')[[1]]
+    a_ <- sapply(a, function (k) algorithm_map[[k]])
+    a_ <- paste0('{', paste0(a_, collapse = ', '), '}')
+    groups <- c(groups, a_)
+  }
+  
+  groups <- paste0('{', paste0(groups, collapse = ', '), '}')
+  grouping.dt[[i]] <- data.table(k = dim, fid = fid, groups = copy(groups))
+  i <- i + 1
+}
+grouping.dt <- rbindlist(grouping.dt)
+
+.level <- unique(grouping.dt$k) %>% 
+  gsub('(\\d+)D', '\\1', .) %>% 
+  as.integer %>% 
+  sort %>% 
+  paste0('D')
+grouping.dt[, k := factor(k, levels = .level)]
+
+.level <- unique(grouping.dt$fid) %>% 
+  gsub('F(\\d+)', '\\1', .) %>% 
+  as.integer %>% 
+  sort %>% 
+  paste0('F', .)
+grouping.dt[, fid := factor(fid, levels = .level)]
+grouping.dt <- grouping.dt[order(k, fid)]
+print(xtable(grouping.dt, type = 'latex'), include.rownames = F)
+```
+
+## Multivariate Epsilon test + LDA to determine which one is better
+```{r}
+data_dir <- './DSC-result'
+files <- list.files(path = data_dir, pattern = "^multivariate_sets")
+group.mean.ld <- list()
+ld.df <- list()
+
+algorithm_map <- list(
+  `1` = 'NSGA-II',
+  `2` = 'NSGA-III',
+  `3` = 'MOEA/D',
+  `4` = 'SPEA-SDE'
+)
+
+i <- 1
+for (file_name in files) {
+  fid <- gsub('.*_(F\\d+)_.*', '\\1', file_name)
+  dim <- gsub('.*_(\\d+D).*', '\\1', file_name)
+  
+  dt_ <- dt[Problem == fid & obj == dim] %>% 
+    dcast(Algorithm + Problem + Exp + obj ~ Indicator, value.var = 'value') 
+  dt_ <- dt_[, .(Algorithm, DeltaP, HV)
+             ][, Algorithm := as.character(Algorithm)]
+  
+  if (sd(dt_$DeltaP) == 0 | sd(dt_$HV) == 0) {
+    cat(paste('skiping', dim, fid, '\n'))
+    next
+  }
+  
+  con <- file(file.path(data_dir, file_name), 'r') 
+  data <- readLines(con) %>% unique
+  close(con)
+  
+  for (g in groups) {
+    a <- strsplit(as.character(g), ' ')[[1]]
+    a_ <- sapply(a, function (k) algorithm_map[[k]])
+    if (length(a_) > 1) {
+      dt_[Algorithm %in% a_, Algorithm := paste0(a_, collapse = ' ')]
+    }
+  }
+  
+  dt.lda <- lda(Algorithm ~ ., data = dt_, method = 't')
+  group.mean <- dt.lda$means
+  
+  index <- apply(
+    dt.lda$scaling, 2, 
+    function (x) length(unique(sign(x))) == 1
+  ) %>% 
+    which
+  
+  if (length(index) == 0) {
+    ld <- c(.5, .5) %>% t %>% t
+    score <- as.matrix(dt_[, -c('Algorithm')]) %*% ld %>% t
+  } else {
+    if (length(index) > 1) index <- index[1]
+    ld <- abs(dt.lda$scaling[, index, drop = F])
+    ld <- ld / sum(ld)   # make sure the weights sum up to one
+    score <- as.matrix(dt_[, -c('Algorithm')]) %*% ld %>% t
+  }
+  
+  p <- gg.hist(
+    data.table(x = score[1, ], group = dt_$Algorithm), dim, fid
+  )
+  
+  ggsave(paste0('lda/', fid, '_' , dim, '.pdf'), plot = p, width = 300, height = 300, dpi = 100, units = 'mm',
+         device = cairo_pdf)
+  
+  group.mean.ld[[i]] <- data.table(obj = dim, Problem = fid, t(group.mean %*% ld))
+  ld.df[[i]] <- data.table(obj = dim, Problem = fid, t(ld))
+  i <- i + 1
+}
+
+ld.df <- rbindlist(ld.df)
+ld.df[, slope := HV / DeltaP]
+```
+
+## Scatter plot of the performance values
+```{r}
+ld.df[, obj := factor(obj, levels = levels(dt_plot$obj))]
+ld.df[, Problem := factor(Problem, levels = levels(dt_plot$Problem))]
+
+p <- ggplot() + 
+  geom_abline(data = ld.df, mapping = aes(slope = slope, intercept = 0), linetype = 'dashed', size = 1.3, alpha = 0.7) +
+  geom_point(data = dt_plot, aes(DeltaP, HV, colour = as.factor(Algorithm)), size = 3, alpha = 0.8, shape = 20) +
+  labs(x = TeX('$1-\\Delta_2_{norm}$'), y = TeX('$HV_{norm}$')) + 
+  facet_grid(rows = vars(Problem), cols = vars(obj), scales = "free") +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE),
+         colour = guide_legend(title = 'Algorithm', nrow = 1, byrow = TRUE)) + 
+  labs(title = '') + 
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 17),
+    axis.text.y = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 17),
+    axis.title.x = element_text(vjust = -.7, size = 30),
+    axis.title.y = element_text(vjust = .7, size = 30),
+    strip.text.x = element_text(size = 30),
+    strip.text.y = element_text(size = 30),
+    text = element_text(size = 26),
+  )
+
+ggsave('scatter.pdf', plot = p, width = 500, height = 700, dpi = 100, units = 'mm',
+       device = cairo_pdf)
+```
+
+## Heatmap of the rankings of algorithms 
+```{r}
+data_dir <- './DSC-result'
+types <- c(
+  'data_driven',
+  'DeltaP', 'HV',
+  'hierarchical'
+)
+
+dt.rank <- list()
+i <- 1
+for (type in types) {
+  files <- list.files(path = data_dir, pattern = paste0('^ranking_', type))
+  
+  for (file_name in files) {
+    dim <- gsub(paste0('^ranking_', type, '_(\\d+D).*'), '\\1', file_name)
+    rank <- 4 - fread(file.path(data_dir, file_name), skip = 1)[, -c('V1')]
+    mean.rank <- apply(as.matrix(rank), 2, mean)
+    dt.rank[[i]] <- data.table(obj = dim, method = type, t(mean.rank))
+    i <- i + 1
+  }
+}
+
+dt.rank <- rbindlist(dt.rank) %>% 
+    set_colnames(c('obj', 'method', 'NSGA-II', 'NSGA-III', 'MOEA/D', 'SPEA-SDE')) %>% 
+    melt(id.vars = c('obj', 'method'), variable.name = "algorithm", value.name = "rank")
+
+.level <- unique(dt.rank$obj) %>% 
+  gsub('(\\d+)D', '\\1', .) %>% 
+  as.integer %>% 
+  sort %>% rev %>% 
+  paste0('D')
+dt.rank[, obj := factor(obj, levels = .level)]
+
+dt.rank[method == 'DeltaP', method := as.character(TeX('HV'))]
+dt.rank[method == 'HV', method := as.character(TeX('$\\Delta_2$'))]
+dt.rank[method == 'hierarchical', method := as.character(TeX('hierarchical'))]
+dt.rank[method == 'data_driven', method := as.character(TeX('data-driven'))]
+dt.rank[, method := factor(
+  method, levels = c(TeX('HV'), TeX('$\\Delta_2$'), TeX('hierarchical'), TeX('data-driven'))
+)]
+
+p <- ggplot(dt.rank, aes(algorithm, obj, fill = rank)) +
+  geom_tile() +
+  scale_fill_viridis(discrete = F, direction = -1) +
+  facet_wrap(vars(method), nrow = 1, labeller=label_parsed) +
+  labs(x = '', y = '') +
+  guides(fill = guide_colourbar(barwidth = 35, barheight = 3)) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0, size = 30),
+    axis.text.y = element_text(angle = 0, hjust = 0, vjust = 0.5, size = 30),
+    strip.text.x = element_text(size = 33),
+    strip.text.y = element_text(size = 33),
+    legend.title = element_text(size = 30),
+    legend.text = element_text(size = 30)
+  )
+
+ggsave(
+  paste('mean-ranking.pdf'), plot = p,
+  width = 900, height = 300, dpi = 100, units = 'mm',
+  device = cairo_pdf
+)
+```
+
+## To show the nice example on F16-5D
+```{r}
+dt_F15_5D <- dt_plot[Problem == 'F16' & obj == '5D']
+ld.df_F15_5D <- ld.df[Problem == 'F16' & obj == '5D']
+
+scatter <- ggplot() + 
+  geom_abline(data = ld.df_F15_5D, mapping = aes(slope = slope, intercept = 0), linetype = 'dashed', size = 1.3, alpha = 0.7) +
+  geom_point(data = dt_F15_5D, aes(DeltaP, HV, colour = as.factor(Algorithm)), size = 4, alpha = 0.8, shape = 20) +
+  labs(x = TeX('$1-\\Delta_2_{norm}$'), y = TeX('$HV_{norm}$')) + 
+  guides(
+    fill = guide_legend(nrow = 1, byrow = TRUE),
+    colour = guide_legend(title = 'Algorithm', nrow = 1, byrow = TRUE)
+  ) + 
+  labs(title = '') + 
+  theme(
+    legend.title=element_blank(),
+    plot.title = element_text(size = 0),
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 17),
+    axis.text.y = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 17),
+    axis.title.x = element_text(vjust = -.7, size = 30),
+    axis.title.y = element_text(vjust = .7, size = 30),
+    strip.text.x = element_text(size = 30),
+    strip.text.y = element_text(size = 30),
+    text = element_text(size = 22),
+  )
+
+hist_top <- ggplot(dt_plot, aes(x = DeltaP, colour = Algorithm)) + 
+  geom_density(size = 1.2, alpha = 0.8) + 
+  labs(x = '  ', y = ' ') +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_text(vjust = 3, size = 55),
+    axis.title.x = element_text(vjust = 0)
+  )
+
+empty <- ggplot() +
+  geom_point(aes(1, 1), colour="white") +
+  theme(
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),
+    axis.text.x = element_blank(), 
+    axis.text.y = element_blank(),
+    axis.title.x = element_blank(), 
+    axis.title.y = element_blank()
+  )
+
+hist_right <- ggplot(dt_plot, aes(x = HV, colour = Algorithm)) + 
+  geom_density(size = 1.2, alpha = 0.8) + 
+  coord_flip() + 
+  labs(x = '  ', y = '  ') + 
+  theme(
+    legend.position = "none",
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_text(vjust = 3, size = 127),
+    axis.title.y = element_text(vjust = 0)
+  )
+
+p <- grid.arrange(hist_top, empty, scatter, hist_right, ncol = 2, nrow = 2, widths = c(4, 1), heights = c(1, 4))
+ggsave('example-F16-5D.pdf', plot = p, width = 250, height = 250, dpi = 100, units = 'mm', device = cairo_pdf)
+```
+
+

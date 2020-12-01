@@ -1,0 +1,5 @@
+"names" "p_values"
+"1" "ranking_DeltaP_15D.txt" 0.000391756929367659
+"2" "ranking_HV_15D.txt" 0.0224825225966276
+"3" "ranking_data_driven_15D.txt" 0.00144406740443526
+"4" "ranking_hierarchical_15D.txt" 2.39425084418432e-05
